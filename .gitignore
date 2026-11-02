@@ -1,0 +1,21 @@
+# dependencies
+node_modules
+
+# build outputs
+dist
+build
+coverage
+
+# environment
+.env*
+!.env.example
+
+# Clever Cloud link (app id of the person who deployed)
+.clever.json
+
+# OS and editors
+.DS_Store
+Thumbs.db
+.vscode
+.idea
+*.log
