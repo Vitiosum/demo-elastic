@@ -6,6 +6,8 @@
 
 **Run it yourself.** The hosted demo was taken down after the presales review (November 2026). The steps in [Deploy on Clever Cloud](#deploy-on-clever-cloud) recreate it from scratch in about 20 minutes, most of it waiting for Elasticsearch, Kibana and the APM server to be provisioned.
 
+**Get certified.** This demo runs on Clever Cloud. To deploy your own apps the same way, get certified at the [Clever Cloud Academy](https://academy.clever.cloud/).
+
 | Storm lever | Searchlight on a ship | Phone |
 |---|---|---|
 | ![Storm: rain, lightning and a burst of ships](docs/screenshot-storm.png) | ![The beam fixed on the ship found by the search](docs/screenshot-search.png) | ![The same page on a phone](docs/screenshot-phone.png) |
