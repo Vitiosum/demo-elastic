@@ -6,7 +6,7 @@
 
 ![The Lighthouse: the bay at night, the beam, the ships and the brass control room](docs/screenshot.png)
 
-**Run it yourself.** The hosted demo was taken down after the presales review (November 2026). The steps in [Deploy on Clever Cloud](#deploy-on-clever-cloud) recreate it from scratch in about 20 minutes, most of it waiting for Elasticsearch, Kibana and the APM server to be provisioned.
+**Run it yourself.** A live copy runs at <https://app-4fde7f56-26fc-4b55-b614-e62e66da00fe.cleverapps.io/> (redeployed on 2026-11-10; it may be stopped between demos). The steps in [Deploy on Clever Cloud](#deploy-on-clever-cloud) recreate it from scratch in about 20 minutes, most of it waiting for Elasticsearch, Kibana and the APM server to be provisioned.
 
 **Get certified.** This demo runs on Clever Cloud. To deploy your own apps the same way, get certified at the [Clever Cloud Academy](https://academy.clever.cloud/).
 
