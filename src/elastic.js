@@ -47,8 +47,33 @@ const MAPPINGS = {
   },
 };
 
+// An index created before the template exists (a write that reached Elasticsearch first) gets a
+// dynamic mapping: "outcome" becomes "text" and the aggregations fail with a "fielddata" error.
+// These are the fields the searches sort and aggregate on.
+const EXPECTED_TYPES = { '@timestamp': 'date', outcome: 'keyword', duration_ms: 'float', 'ship.name': 'search_as_you_type' };
+
+class MappingError extends Error {
+  constructor(problems) {
+    super(`The index ${INDEX} exists with the wrong mapping (${problems.join(', ')}): it was created without the index template. `
+      + `Delete it (DELETE /${INDEX} in Kibana Dev Tools), the app then recreates it with the template and the seed ships.`);
+    this.name = 'MappingError';
+  }
+}
+
+async function checkMapping(es) {
+  const res = await es.indices.getMapping({ index: INDEX });
+  const root = Object.values(res)[0]?.mappings || {};
+  const problems = Object.entries(EXPECTED_TYPES).flatMap(([field, expected]) => {
+    const found = field.split('.').reduce((node, key) => node?.properties?.[key], root)?.type || 'missing';
+    return found === expected ? [] : [`${field} is "${found}", expected "${expected}"`];
+  });
+  if (problems.length) throw new MappingError(problems);
+}
+
 // Single-node add-on: 1 shard, 0 replica, priority above the add-on's default
 // template (see "Create an index on Elasticsearch" in the Clever Cloud doc).
+// Throws while Elasticsearch does not answer yet (the caller retries), and a
+// MappingError when the index already exists without the template's mapping.
 async function prepareIndex(es) {
   await es.indices.putIndexTemplate({
     name: INDEX,
@@ -63,7 +88,8 @@ async function prepareIndex(es) {
     priority: 200,
     template: { settings: { number_of_shards: 1, number_of_replicas: 0 } },
   });
-  if (!(await es.indices.exists({ index: INDEX }))) await es.indices.create({ index: INDEX });
+  if (await es.indices.exists({ index: INDEX })) await checkMapping(es);
+  else await es.indices.create({ index: INDEX });
 }
 
 // The add-on is a single node, so a replica can never be assigned. The APM option creates
@@ -90,6 +116,9 @@ async function singleNodeApm(es) {
 async function seed(es, ships) {
   const operations = ships.flatMap(({ id, doc }) => [{ create: { _index: INDEX, _id: id } }, doc]);
   const res = await es.bulk({ operations, refresh: 'wait_for' });
+  // 201 = created, 409 = already there. Anything else means the seed is not in place.
+  const failed = res.items.find((item) => ![201, 409].includes(item.create.status));
+  if (failed) throw new Error(`seed ship ${failed.create._id} refused (HTTP ${failed.create.status})`);
   return res.items.filter((item) => item.create.status === 201).length;
 }
 
@@ -200,4 +229,4 @@ async function deepHealth(es) {
   return { cluster: result.status, version: info.version.number, ms };
 }
 
-module.exports = { INDEX, createClient, prepareIndex, singleNodeApm, seed, indexShip, getShip, searchShips, searchBody, harbour, harbourBody, drained, deepHealth };
+module.exports = { INDEX, MappingError, createClient, prepareIndex, singleNodeApm, seed, indexShip, getShip, searchShips, searchBody, harbour, harbourBody, drained, deepHealth };

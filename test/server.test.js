@@ -1,11 +1,11 @@
 // Route tests with an in-memory stand-in for the Elasticsearch client (no add-on needed).
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { createApp, platform } = require('../src/server');
+const { createApp, prepare, retryDelay, platform } = require('../src/server');
 
 function fakeElastic() {
   const docs = new Map();
-  return {
+  const es = {
     docs,
     async index({ document }) {
       const id = `doc-${docs.size + 1}`;
@@ -36,13 +36,37 @@ function fakeElastic() {
         },
       };
     },
+    // What the startup needs: templates, the index, its mapping and the seed fleet.
+    templates: [],
+    index_exists: false,
+    mapping: null, // set to a dynamic mapping to play an index created without the template
+    indices: {
+      putIndexTemplate: async function ({ name, template }) { es.down(); es.templates.push(name); if (template.mappings) es.mapping ||= template.mappings; },
+      exists: async () => es.index_exists,
+      create: async () => { es.index_exists = true; },
+      getMapping: async () => ({ 'lighthouse-ships': { mappings: es.mapping } }),
+      getIndexTemplate: async () => ({ index_templates: [] }),
+      putSettings: async () => ({}),
+    },
+    async bulk({ operations }) {
+      const items = [];
+      for (let i = 0; i < operations.length; i += 2) {
+        const id = operations[i].create._id;
+        items.push({ create: { _id: id, status: docs.has(id) ? 409 : 201 } });
+        docs.set(id, operations[i + 1]);
+      }
+      return { items };
+    },
+    failures: 0, // the next N template calls fail like the add-on proxy before Elasticsearch is up
+    down() { if (es.failures-- > 0) throw new Error('Response Error: 404'); },
     cluster: { health: async () => ({ status: 'green' }) },
     info: async () => ({ version: { number: '9.2.3' } }),
   };
+  return es;
 }
 
-async function start(es) {
-  const server = createApp({ es, env: {} }).listen(0);
+async function start(es, setup) {
+  const server = createApp({ es, setup, env: {} }).listen(0);
   await new Promise((r) => server.once('listening', r));
   const base = `http://127.0.0.1:${server.address().port}`;
   return { base, close: () => new Promise((r) => server.close(r)) };
@@ -136,4 +160,85 @@ test('the platform panel only exposes the 7 allowed variables', () => {
   assert.deepEqual(Object.keys(p), ['CC_APP_NAME', 'APP_ID', 'INSTANCE_NUMBER', 'INSTANCE_TYPE', 'CC_PRETTY_INSTANCE_NAME', 'CC_COMMIT_ID', 'CC_DEPLOYMENT_ID']);
   assert.equal(p.CC_COMMIT_ID, '0123456');
   assert.ok(!JSON.stringify(p).includes('secret'));
+});
+
+const post = (base) => fetch(`${base}/api/ships`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+const quiet = (t) => { t.mock.method(console, 'error', () => {}); t.mock.method(console, 'log', () => {}); };
+
+test('while Elasticsearch is not up, the app answers, refuses writes with 503 and retries with a growing delay', async (t) => {
+  quiet(t);
+  const es = fakeElastic();
+  es.failures = 3;
+  const setup = { phase: 'preparing', attempts: 0, error: null };
+  const app = await start(es, setup);
+  t.after(app.close);
+
+  // Each wait is held until the test releases it, so the "preparing" state can be observed.
+  const waits = [];
+  const wait = (ms) => new Promise((release) => waits.push({ ms, release }));
+  const done = prepare(es, setup, wait);
+  while (waits.length < 1) await new Promise((r) => setImmediate(r));
+
+  assert.equal((await fetch(`${app.base}/`)).status, 200);
+  assert.deepEqual(await (await fetch(`${app.base}/health`)).json(), { status: 'ok', setup: 'preparing' });
+  const refused = await post(app.base);
+  assert.equal(refused.status, 503);
+  assert.match((await refused.json()).error, /getting ready/);
+  assert.equal((await fetch(`${app.base}/api/harbour`)).status, 503);
+  assert.equal(es.docs.size, 0, 'nothing is written before the template exists');
+  assert.equal((await (await fetch(`${app.base}/api/state`)).json()).setup.phase, 'preparing');
+
+  for (let i = 0; i < 3; i += 1) {
+    while (waits.length <= i) await new Promise((r) => setImmediate(r));
+    waits[i].release();
+  }
+  await done;
+  assert.deepEqual(waits.map((w) => w.ms), [1000, 2000, 4000]);
+  assert.equal(setup.phase, 'ready');
+  assert.deepEqual(es.templates, ['lighthouse-ships', 'lighthouse-drain']);
+  assert.equal(es.docs.size, 48);
+  assert.equal((await post(app.base)).status, 201);
+  assert.equal((await (await fetch(`${app.base}/api/harbour`)).json()).total, 49);
+});
+
+test('the retry delay doubles and stops at 30 s', () => {
+  assert.deepEqual([1, 2, 3, 5, 6, 7, 40].map((n) => retryDelay(n)), [1000, 2000, 4000, 16000, 30000, 30000, 30000]);
+});
+
+test('an index created without the template is reported, then accepted once it is deleted', async (t) => {
+  quiet(t);
+  const es = fakeElastic();
+  es.index_exists = true;
+  es.mapping = { properties: { '@timestamp': { type: 'date' }, outcome: { type: 'text' }, duration_ms: { type: 'float' }, ship: { properties: { name: { type: 'text' } } } } };
+  const setup = { phase: 'preparing', attempts: 0, error: null };
+  const app = await start(es, setup);
+  t.after(app.close);
+
+  const waits = [];
+  const done = prepare(es, setup, (ms) => new Promise((release) => waits.push({ ms, release })));
+  while (waits.length < 1) await new Promise((r) => setImmediate(r));
+
+  assert.equal(setup.phase, 'bad-mapping');
+  const res = await fetch(`${app.base}/api/harbour`);
+  assert.equal(res.status, 503);
+  const { error } = await res.json();
+  assert.match(error, /wrong mapping \(outcome is "text", expected "keyword", ship\.name is "text", expected "search_as_you_type"\)/);
+  assert.match(error, /DELETE \/lighthouse-ships/);
+  assert.equal((await post(app.base)).status, 503);
+  assert.equal(es.docs.size, 0);
+
+  // The index is deleted by hand: the next attempt recreates it from the template, no restart.
+  es.index_exists = false;
+  es.mapping = null;
+  waits[0].release();
+  await done;
+  assert.equal(setup.phase, 'ready');
+  assert.equal(es.docs.size, 48);
+});
+
+test('a second start adds no seed ship', async (t) => {
+  quiet(t);
+  const es = fakeElastic();
+  for (let boot = 0; boot < 2; boot += 1) await prepare(es, { phase: 'preparing', attempts: 0, error: null }, async () => {});
+  assert.equal(es.docs.size, 48);
 });

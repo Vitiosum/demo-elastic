@@ -102,7 +102,9 @@
         addToTape(body);
         state.error = null;
       } else if (!ok) {
-        state.error = status === 429 ? 'The harbour is full for a second (HTTP 429).' : `No ship could sail: ${esc(body.error || `HTTP ${status}`)}`;
+        if (status === 429) state.error = 'The harbour is full for a second (HTTP 429).';
+        else if (body.setup) state.error = esc(body.error); // index template and seed ships not in place yet
+        else state.error = `No ship could sail: ${esc(body.error || `HTTP ${status}`)}`;
       }
     } catch (err) {
       state.error = 'The harbour does not answer. Is the app running?';
@@ -353,8 +355,12 @@
     $('#chart-note').hidden = Boolean(body.kibana);
     const health = await api('/health/deep');
     const es = health.body.elasticsearch;
-    $('#es-text').textContent = es ? `Elasticsearch ${es.version} · ${es.cluster}` : 'Elasticsearch offline';
-    $('#es-pill').className = `cc-pill ${health.ok ? 'cc-pill--ok' : 'cc-pill--muted'}`;
+    // Until the index template and the seed ships are in place, say so and look again.
+    const pending = body.setup && body.setup.phase !== 'ready' ? body.setup.phase : null;
+    const PENDING = { preparing: 'Elasticsearch: preparing the index', 'bad-mapping': 'Elasticsearch: wrong index mapping' };
+    $('#es-text').textContent = pending ? PENDING[pending] : es ? `Elasticsearch ${es.version} · ${es.cluster}` : 'Elasticsearch offline';
+    $('#es-pill').className = `cc-pill ${health.ok && !pending ? 'cc-pill--ok' : 'cc-pill--muted'}`;
+    if (pending) setTimeout(loadState, 5000);
     if (es) $('#stack-pill').textContent = `Node.js 24 · Elasticsearch ${es.version} · APM · Kibana`;
   }
 

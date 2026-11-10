@@ -48,22 +48,30 @@ function logLine(doc) {
   console.log(JSON.stringify({ level: log.level, message, ship: ship.name, outcome, weather, duration_ms: durationMs, trace_id: trace?.id }));
 }
 
-function createApp({ es, ready = Promise.resolve(), env = process.env } = {}) {
+// What the API answers while the index template and the seed ships are not in place.
+function setupMessage(setup) {
+  if (setup.phase === 'bad-mapping') return setup.error;
+  return `The lighthouse is getting ready: waiting for Elasticsearch to create the index template and the seed ships (attempt ${setup.attempts + 1}). Try again in a few seconds.`;
+}
+
+// "setup" is shared with prepare(): phase is "preparing", "bad-mapping" or "ready".
+function createApp({ es, setup = { phase: 'ready', attempts: 0, error: null }, env = process.env } = {}) {
   const app = express();
   app.disable('x-powered-by');
   app.use(express.json({ limit: '2kb' }));
   app.use('/assets', express.static(path.join(__dirname, '..', 'public', 'assets'), { maxAge: '1h' }));
   app.get('/', (req, res) => res.sendFile(path.join(__dirname, '..', 'public', 'index.html')));
 
-  // Routes that need the add-on wait until the index template exists.
-  const needsElastic = async (req, res, next) => {
+  // Routes that need the add-on are refused until the index template and the seed ships exist:
+  // a write sent earlier would create the index with a dynamic mapping.
+  const needsElastic = (req, res, next) => {
     if (!es) return res.status(503).json({ error: 'Elasticsearch is not configured: link the Elastic Stack add-on.' });
-    await ready;
+    if (setup.phase !== 'ready') return res.status(503).set('Retry-After', '5').json({ error: setupMessage(setup), setup: setup.phase });
     next();
   };
 
   // Health: /health never touches the add-on, /health/deep asks the cluster.
-  app.get('/health', (req, res) => res.json({ status: 'ok' }));
+  app.get('/health', (req, res) => res.json({ status: 'ok', setup: es ? setup.phase : 'unconfigured' }));
   app.get('/health/deep', async (req, res) => {
     if (!es) return res.status(503).json({ status: 'unconfigured', elasticsearch: null });
     try {
@@ -75,7 +83,7 @@ function createApp({ es, ready = Promise.resolve(), env = process.env } = {}) {
   });
 
   app.get('/api/state', (req, res) => {
-    res.json({ platform: platform(env), kibana: kibanaLinks(env), elastic: Boolean(es), apm: apm.isStarted() && Boolean(env.ES_ADDON_APM_HOST), index: elastic.INDEX });
+    res.json({ platform: platform(env), kibana: kibanaLinks(env), elastic: Boolean(es), setup: es ? { phase: setup.phase, message: setup.phase === 'ready' ? null : setupMessage(setup) } : null, apm: apm.isStarted() && Boolean(env.ES_ADDON_APM_HOST), index: elastic.INDEX });
   });
 
   // A ship asks for passage. Weather and lamp come from the levers of the control room.
@@ -151,13 +159,28 @@ function createApp({ es, ready = Promise.resolve(), env = process.env } = {}) {
 }
 
 // Listen first (the health check must answer fast), then prepare the index and the seed fleet.
-async function prepare(es) {
-  try {
-    await elastic.prepareIndex(es);
-    const created = await elastic.seed(es, seedShips());
-    console.log(JSON.stringify({ level: 'info', message: `index ${elastic.INDEX} ready, ${created} seed ships added` }));
-  } catch (err) {
-    console.error(JSON.stringify({ level: 'error', message: `Elasticsearch setup failed: ${err.message}` }));
+// At a first deployment the app can be up before Elasticsearch: retry with a growing delay
+// (1 s, 2 s, 4 s... capped at 30 s) until the template, the index and the seed ships are in place.
+const RETRY = { first: 1000, max: 30000 };
+const retryDelay = (attempt, { first, max } = RETRY) => Math.min(max, first * 2 ** (attempt - 1));
+
+async function prepare(es, setup, wait = sleep) {
+  for (let attempt = 1; setup.phase !== 'ready'; attempt += 1) {
+    try {
+      await elastic.prepareIndex(es);
+      const created = await elastic.seed(es, seedShips());
+      Object.assign(setup, { phase: 'ready', error: null });
+      console.log(JSON.stringify({ level: 'info', message: `index ${elastic.INDEX} ready, ${created} seed ships added (attempt ${attempt})` }));
+    } catch (err) {
+      // A wrong mapping needs a human (delete the index): keep checking, so no restart is needed afterwards.
+      const badMapping = err instanceof elastic.MappingError;
+      // While the add-on is being provisioned, the load balancer answers a whole HTML page (404): keep the log line short.
+      const why = /^\s*</.test(err.message) ? `HTTP ${err.meta?.statusCode ?? '?'}, Elasticsearch is not reachable yet` : err.message;
+      Object.assign(setup, { phase: badMapping ? 'bad-mapping' : 'preparing', attempts: attempt, error: why });
+      const delay = badMapping ? RETRY.max : retryDelay(attempt);
+      console.error(JSON.stringify({ level: badMapping ? 'error' : 'warn', message: `Elasticsearch setup not done (attempt ${attempt}, next in ${delay / 1000} s): ${why}` }));
+      await wait(delay);
+    }
   }
   try {
     const hooks = await elastic.singleNodeApm(es);
@@ -170,11 +193,12 @@ async function prepare(es) {
 function main() {
   const es = elastic.createClient();
   if (!es) console.warn('ES_ADDON_HOST is not set: the lighthouse runs without Elasticsearch.');
-  const ready = es ? prepare(es) : Promise.resolve();
+  const setup = { phase: es ? 'preparing' : 'ready', attempts: 0, error: null };
   const port = Number(process.env.PORT) || 8080;
-  createApp({ es, ready }).listen(port, '0.0.0.0', () => console.log(`The lighthouse is lit on port ${port}`));
+  createApp({ es, setup }).listen(port, '0.0.0.0', () => console.log(`The lighthouse is lit on port ${port}`));
+  if (es) prepare(es, setup);
 }
 
 if (require.main === module) main();
 
-module.exports = { createApp, platform, kibanaLinks };
+module.exports = { createApp, prepare, retryDelay, platform, kibanaLinks };

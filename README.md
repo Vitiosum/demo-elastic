@@ -2,6 +2,8 @@
 
 > A lighthouse on a Breton headland, at night. Every request to the app is a ship crossing the bay: **Elasticsearch** logs each one as a JSON document, the **Elastic APM** agent follows its voyage, and **Kibana** keeps the chart. Brass levers in the control room roll in the fog (slow replies), raise a storm (a burst of traffic) or break the lamp (errors with stack traces). The beam turns faster as traffic grows, because its speed comes from an Elasticsearch aggregation. Hail a ship by name and the beam swings onto it, while the logbook shows the exact query, its hits and the time Elasticsearch took. Node.js 24 and Express 5, deployed on Clever Cloud with the Elastic Stack add-on, dressed in the Clever Brand Kit.
 
+![Live on Clever Cloud: the Storm lever sends a burst of ships that Elasticsearch logs, the dial climbs from 5 to 41 ships a minute, then a search for "gull" finds 2 matches and the beam swings onto the ship](docs/tour.gif)
+
 ![The Lighthouse: the bay at night, the beam, the ships and the brass control room](docs/screenshot.png)
 
 **Run it yourself.** The hosted demo was taken down after the presales review (November 2026). The steps in [Deploy on Clever Cloud](#deploy-on-clever-cloud) recreate it from scratch in about 20 minutes, most of it waiting for Elasticsearch, Kibana and the APM server to be provisioned.
@@ -30,6 +32,8 @@
 All Elasticsearch calls live in [`src/elastic.js`](src/elastic.js). Each one returns the request it ran (method, path, body) next to its result, which is how the page can show it.
 
 At startup the app creates an index template (1 shard, 0 replica, explicit mapping, priority above the add-on's default `cc_singlenode_template`, as the [Clever doc](https://www.clever.cloud/developers/doc/deploy/databases/elastic/#create-an-index-on-elasticsearch) asks), the `lighthouse-ships` index, and 48 seed ships with fixed ids, so the first screen is never empty and a restart adds nothing.
+
+**If the app is up before Elasticsearch.** At a first deployment the app can start before the add-on answers. It listens at once (`/` and `/health` answer 200), retries the setup with a growing delay (1 s, 2 s, 4 s… capped at 30 s) and, until the template, the index and the seed ships are in place, answers 503 with a message on every `/api` route that needs Elasticsearch: no ship is written before the template exists. `GET /health` and `GET /api/state` show the phase (`preparing`, then `ready`), and so does the page. If `lighthouse-ships` already exists with a mapping that did not come from the template (`outcome` as `text`, the cause of a `fielddata` error), the phase is `bad-mapping` and the message names the fields: delete the index (`DELETE /lighthouse-ships` in Kibana Dev Tools) and the app recreates it within 30 s, with no restart.
 
 ---
 
@@ -66,7 +70,7 @@ clever deploy
 clever open
 ```
 
-There is no secret to generate and no setup script: the linked add-on injects the `ES_ADDON_*` variables below, and at its first start the app creates the index template, the `lighthouse-ships` index and the seed ships (see above). `GET /health/deep` reports the cluster health.
+There is no secret to generate and no setup script: the linked add-on injects the `ES_ADDON_*` variables below, and at its first start the app creates the index template, the `lighthouse-ships` index and the seed ships, and retries until Elasticsearch answers (see above). `GET /health` shows `"setup": "ready"` once this is done, and `GET /health/deep` reports the cluster health.
 
 Kibana and the APM server appear in the organisation as two applications named `Kibana - addon_…` and `APM - addon_…`, plus a `Backups` Cellar add-on for the daily snapshots. Provisioning takes a few minutes. To sign in to Kibana, see [Open Kibana and APM](#open-kibana-and-apm).
 
@@ -112,13 +116,13 @@ Node.js 24 comes from `engines.node` in `package.json`. The "Running on Clever C
 | Route | What it does |
 |---|---|
 | `GET /` | the page |
-| `POST /api/ships` | a ship: `{"weather": "clear" \| "fog" \| "storm", "lamp": "ok" \| "broken"}`. 201 with the document and the index request, or 500 for a wreck |
+| `POST /api/ships` | a ship: `{"weather": "clear" \| "fog" \| "storm", "lamp": "ok" \| "broken"}`. 201 with the document and the index request, or 500 for a wreck. 503 while the index template and the seed ships are not in place |
 | `GET /api/ships/:id` | read one ship back from Elasticsearch |
 | `GET /api/ships/search?q=gull` | the full-text search, with its query, `took`, hits and highlights |
 | `GET /api/harbour` | the dials: latest ships and aggregations |
 | `GET /api/drain` | count and latest line of the drained stdout |
-| `GET /api/state` | platform variables and Kibana links |
-| `GET /health` | 200, never touches the add-on |
+| `GET /api/state` | platform variables, Kibana links and the setup phase |
+| `GET /health` | 200, never touches the add-on; `setup` is `preparing`, `bad-mapping`, `ready` or `unconfigured` |
 | `GET /health/deep` | cluster health and version, 503 if Elasticsearch does not answer |
 
 A small per-instance limit (40 ships a second) answers 429 beyond it, so a public URL cannot flood the index. The page stops its background traffic after 10 minutes without interaction, and while the tab is hidden.
@@ -136,7 +140,7 @@ A small per-instance limit (40 ships a second) answers 429 beyond it, so a publi
 
 ```bash
 npm install
-npm test                 # 16 tests, an in-memory stand-in replaces Elasticsearch
+npm test                 # 20 tests, an in-memory stand-in replaces Elasticsearch
 PORT=8400 npm start      # http://localhost:8400
 ```
 
